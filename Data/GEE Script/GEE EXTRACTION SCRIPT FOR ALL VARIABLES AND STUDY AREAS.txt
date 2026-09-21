@@ -1,0 +1,278 @@
+/*******************************************************************************
+ * MULTI-SCALE HARMONIZATION & RESTREND LAND DEGRADATION PIPELINE
+ * 
+ * Study Regions       : Katsina (Nigeria) & Rajasthan (India) Assets
+ * Target Scale Anchor : MODIS 250m Sinusoidal Grid (MOD13Q1)
+ * Observation Period  : 2000 - 2020 (21 Complete Years)
+ * Methodological Base : Evans & Geerken (2004) RESTREND Analysis
+ *******************************************************************************/
+
+// ==============================================================================
+// 1. STUDY REGION ASSETS & SPATIAL BLOCK DEFINITION
+// ==============================================================================
+
+// Load Custom GEE Assets
+var katsina   = ee.FeatureCollection("projects/soy-involution-501718-r9/assets/Katsina");
+var rajasthan = ee.FeatureCollection("projects/soy-involution-501718-r9/assets/Rajasthan");
+
+Map.centerObject(katsina, 7);
+
+// Create 10km x 10km Spatial Blocks for Spatial Block Cross-Validation (GroupKFold)
+function createSpatialBlocks(geometry, blockSizeMeters) {
+  var proj = ee.Projection('EPSG:3857').scale(blockSizeMeters, blockSizeMeters);
+  return geometry.coveringGrid(proj);
+}
+
+var blocksKatsina   = createSpatialBlocks(katsina.geometry(), 10000);
+var blocksRajasthan = createSpatialBlocks(rajasthan.geometry(), 10000);
+
+// ==============================================================================
+// 2. SCALE ANCHOR & TARGET PROJECTION SETUP (MODIS 250m)
+// ==============================================================================
+
+// Dynamic Scale Anchor: Fetch projection directly from MODIS collection
+var modisAnchor = ee.ImageCollection("MODIS/061/MOD13Q1").first().select('NDVI');
+var targetProjection = modisAnchor.projection();
+
+// ==============================================================================
+// 3. TARGET VARIABLE (Y): 2000–2020 RESTREND CALCULATOR
+// ==============================================================================
+
+var years = ee.List.sequence(2000, 2020);
+
+// Build Annual Max NDVI (MOD13Q1) and Cumulative Rainfall (CHIRPS) ImageCollection
+var annualData = ee.ImageCollection(years.map(function(y) {
+  var yearNum = ee.Number(y);
+  
+  // Annual Peak NDVI (0.0001 Scale Factor)
+  var ndviMax = ee.ImageCollection("MODIS/061/MOD13Q1")
+    .filterDate(ee.Date.fromYMD(yearNum, 1, 1), ee.Date.fromYMD(yearNum, 12, 31))
+    .select('NDVI')
+    .max()
+    .multiply(0.0001)
+    .rename('NDVI_max');
+    
+  // Annual Cumulative Rainfall (CHIRPS v2.0)
+  var precipTotal = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD")
+    .filterDate(ee.Date.fromYMD(yearNum, 1, 1), ee.Date.fromYMD(yearNum, 12, 31))
+    .select('precipitation')
+    .sum()
+    .rename('Precip_annual');
+    
+  return ee.Image.cat([
+    ee.Image.constant(1).toFloat(), 
+    precipTotal.toFloat(), 
+    ndviMax.toFloat()
+  ])
+  .rename(['constant', 'Precip_annual', 'NDVI_max'])
+  .set('year', yearNum)
+  .set('system:time_start', ee.Date.fromYMD(yearNum, 1, 1).millis());
+}));
+
+// Step 3A: Ordinary Least Squares (OLS) Baseline Regression (NDVI_max = alpha + beta * Precip)
+var baselineRegression = annualData.select(['constant', 'Precip_annual', 'NDVI_max'])
+  .reduce(ee.Reducer.linearRegression(2, 1));
+
+var alpha = baselineRegression.select('coefficients').arrayGet([0, 0]);
+var betaRain = baselineRegression.select('coefficients').arrayGet([1, 0]);
+
+// Step 3B: Compute Annual Residuals (Residual = NDVI_obs - NDVI_predicted)
+var residualCollection = annualData.map(function(img) {
+  var yearNum = ee.Number(img.get('year'));
+  var precip = img.select('Precip_annual');
+  var ndviObs = img.select('NDVI_max');
+  
+  var ndviPred = alpha.add(betaRain.multiply(precip));
+  var residual = ndviObs.subtract(ndviPred);
+  
+  var timeIndex = ee.Image.constant(yearNum.subtract(2000)).toFloat();
+  return ee.Image.cat([
+    ee.Image.constant(1).toFloat(), 
+    timeIndex, 
+    residual.toFloat()
+  ])
+  .rename(['constant', 'time', 'residual']);
+});
+
+// Step 3C: RESTREND Slope (gamma_1 = Linear OLS trend of Residuals over time 2000-2020)
+var restrendRegression = residualCollection.reduce(ee.Reducer.linearRegression(2, 1));
+var restrendSlope = restrendRegression.select('coefficients')
+  .arrayGet([1, 0])
+  .rename('RESTREND_Slope');
+
+// ==============================================================================
+// 4. EXOGENOUS PREDICTOR MATRIX (X1 - X11) HARMONIZATION
+// ==============================================================================
+
+// --- CLIMATE FORCING (CHIRPS: Bicubic Downscaling) ---
+var chirps2000_2020 = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD")
+  .filterDate('2000-01-01', '2020-12-31')
+  .select('precipitation');
+
+var meanPrecip250m = chirps2000_2020.sum().divide(21)
+  .resample('bicubic')
+  .rename('Precip_Mean');
+
+var stdPrecip = chirps2000_2020.reduce(ee.Reducer.stdDev());
+var cvPrecip250m = stdPrecip.divide(chirps2000_2020.mean())
+  .resample('bicubic')
+  .rename('Precip_CV');
+
+// --- ATMOSPHERIC DEMAND (ERA5-Land VPD: Bicubic Downscaling) ---
+var era5Land = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR")
+  .filterDate('2000-01-01', '2020-12-31');
+
+var vpdCollection = era5Land.map(function(img) {
+  var t = img.select('temperature_2m').subtract(273.15);
+  var td = img.select('dewpoint_temperature_2m').subtract(273.15);
+  
+  var es = ee.Image(0.61078).multiply(t.multiply(17.27).divide(t.add(237.3)).exp());
+  var ea = ee.Image(0.61078).multiply(td.multiply(17.27).divide(td.add(237.3)).exp());
+  return es.subtract(ea).rename('VPD');
+});
+
+var vpd250m = vpdCollection.mean()
+  .resample('bicubic')
+  .rename('VPD_Mean');
+
+// --- THERMAL DRIVER (MODIS Daytime LST: Bicubic Downscaling) ---
+var lst250m = ee.ImageCollection("MODIS/061/MOD11A2")
+  .filterDate('2000-01-01', '2020-12-31')
+  .select('LST_Day_1km')
+  .mean()
+  .multiply(0.02)
+  .subtract(273.15)
+  .resample('bicubic')
+  .rename('LST_Mean');
+
+// --- TOPOGRAPHY (NASADEM: Native Resolution) ---
+var nasadem = ee.Image("NASA/NASADEM_HGT/001");
+
+var elevation250m = nasadem.select('elevation')
+  .rename('Elevation');
+
+var slope30m = ee.Terrain.slope(nasadem.select('elevation'));
+var slope250m = slope30m
+  .rename('Slope');
+
+var cellArea = ee.Image.pixelArea();
+var slopeRad = slope30m.multiply(Math.PI / 180.0);
+var twi250m = cellArea.divide(slopeRad.tan().max(0.001)).log()
+  .rename('TWI');
+
+// --- EDAPHIC PROPERTIES (SoilGrids 250m) ---
+var sand250m = ee.Image("projects/soilgrids-isric/sand_mean")
+  .select('sand_0-5cm_mean')
+  .divide(10)
+  .rename('Sand_Percent');
+
+var clay250m = ee.Image("projects/soilgrids-isric/clay_mean")
+  .select('clay_0-5cm_mean')
+  .divide(10)
+  .rename('Clay_Percent');
+
+var soc250m = ee.Image("projects/soilgrids-isric/soc_mean")
+  .select('soc_0-5cm_mean')
+  .divide(10)
+  .rename('SOC');
+
+// --- ANTHROPOGENIC PRESSURE (EC JRC GHSL 2020) ---
+var pop250m = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
+  .select('population_count')
+  .unmask(0)
+  .rename('Population_2020');
+
+// ==============================================================================
+// 5. LAND COVER MASKING & MULTI-BAND STACK PREPARATION
+// ==============================================================================
+
+// Mask non-vegetated pixels (Water, Urban, Permanent Snow) using ESA WorldCover 10m
+var worldCover = ee.ImageCollection("ESA/WorldCover/v100").first();
+var vegetatedMask = worldCover.neq(80)  // Exclude Water
+  .and(worldCover.neq(50))              // Exclude Built-up / Urban
+  .and(worldCover.neq(70));             // Exclude Snow/Ice
+
+var featureStack = ee.Image.cat([
+  restrendSlope,     // Y Target
+  meanPrecip250m,    // X1
+  cvPrecip250m,      // X2
+  vpd250m,           // X3
+  lst250m,           // X4
+  elevation250m,     // X5
+  slope250m,         // X6
+  twi250m,           // X7
+  sand250m,          // X8
+  clay250m,          // X9
+  soc250m,           // X10
+  pop250m            // X11
+]).updateMask(vegetatedMask);
+
+// ==============================================================================
+// 6. SPATIAL POINT EXTRACTION (KATSINA SOURCE & RAJASTHAN TARGET DOMAINS)
+// ==============================================================================
+
+function extractDataset(regionFC, blocksFC, regionName, numPoints) {
+  var samples = featureStack.sample({
+    region: regionFC.geometry(),
+    scale: 250,
+    projection: targetProjection,
+    numPixels: numPoints,
+    geometries: true,
+    dropNulls: true
+  });
+
+  return samples.map(function(feat) {
+    var overlappingBlocks = blocksFC.filterBounds(feat.geometry());
+    var hasBlock = overlappingBlocks.size().gt(0);
+    var block = ee.Feature(overlappingBlocks.first());
+    var blockId = ee.Algorithms.If(hasBlock, block.get('system:index'), 'Unallocated');
+    var coords = feat.geometry().coordinates();
+    
+    return feat.set({
+      'region': regionName,
+      'block_id': blockId,
+      'longitude': coords.get(0),
+      'latitude': coords.get(1)
+    });
+  });
+}
+
+// Extract points bounded strictly within the custom GEE Assets
+var katsinaSamples   = extractDataset(katsina, blocksKatsina, 'Katsina', 10000);
+var rajasthanSamples = extractDataset(rajasthan, blocksRajasthan, 'Rajasthan', 10000);
+
+// ==============================================================================
+// 7. EXPORT TO GOOGLE DRIVE (CSV FORMAT)
+// ==============================================================================
+
+Export.table.toDrive({
+  collection: katsinaSamples,
+  description: 'RESTREND_Katsina_250m_Harmonized_Dataset',
+  fileFormat: 'CSV',
+  selectors: [
+    'region', 'block_id', 'longitude', 'latitude',
+    'RESTREND_Slope', 'Precip_Mean', 'Precip_CV', 'VPD_Mean', 'LST_Mean',
+    'Elevation', 'Slope', 'TWI', 'Sand_Percent', 'Clay_Percent', 'SOC', 'Population_2020'
+  ]
+});
+
+Export.table.toDrive({
+  collection: rajasthanSamples,
+  description: 'RESTREND_Rajasthan_250m_Harmonized_Dataset',
+  fileFormat: 'CSV',
+  selectors: [
+    'region', 'block_id', 'longitude', 'latitude',
+    'RESTREND_Slope', 'Precip_Mean', 'Precip_CV', 'VPD_Mean', 'LST_Mean',
+    'Elevation', 'Slope', 'TWI', 'Sand_Percent', 'Clay_Percent', 'SOC', 'Population_2020'
+  ]
+});
+
+// Map Visualization
+var restrendVis = {
+  min: -0.01,
+  max: 0.01,
+  palette: ['#d7191c', '#fdae61', '#ffffbf', '#a6d96a', '#1a9641']
+};
+
+Map.addLayer(restrendSlope.clip(katsina), restrendVis, 'Katsina RESTREND Slope (2000-2020)');
+Map.addLayer(restrendSlope.clip(rajasthan), restrendVis, 'Rajasthan RESTREND Slope (2000-2020)');
